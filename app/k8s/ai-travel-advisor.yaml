@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: ai-travel-advisor
-          image: shinojosa/ai-travel-advisor:v1.0.1
+          image: dtdemos/ai-travel-advisor:v1.0.0
           ports:
             - name: http
               containerPort: 8082
@@ -28,6 +28,10 @@ spec:
               value: "weaviate.ai-travel-advisor.svc.cluster.local"
             - name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
               value: "delta"
+            - name: AI_MODEL
+              value: "llama3.2:3b"
+            - name: AI_EMBEDDING_MODEL
+              value: "llama3.2:3b"
           imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: secrets

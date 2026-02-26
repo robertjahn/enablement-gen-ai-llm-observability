@@ -1,4 +1,4 @@
-import ollama
+from openai import OpenAI
 from langchain.agents import AgentExecutor, create_structured_chat_agent
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -6,8 +6,7 @@ from langchain_community.document_loaders import BSHTMLLoader
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-from langchain_ollama.chat_models import ChatOllama
-from langchain_ollama.embeddings import OllamaEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import logging
@@ -56,15 +55,29 @@ OTEL_ENDPOINT = read_endpoint()
 if OTEL_ENDPOINT.endswith("/v1/traces"):
     OTEL_ENDPOINT = OTEL_ENDPOINT[: OTEL_ENDPOINT.find("/v1/traces")]
 
-## Configuration of OLLAMA & Weaviate
-OLLAMA_ENDPOINT = os.environ.get("OLLAMA_ENDPOINT", "http://localhost:11434")
+## Configuration of OpenAI-compatible endpoint & Weaviate
+OPENAI_BASE_URL = os.environ.get(
+    "OPENAI_BASE_URL",
+    os.environ.get("OLLAMA_ENDPOINT", "http://localhost:11434"),
+)
+if not OPENAI_BASE_URL.endswith("/v1"):
+    OPENAI_BASE_URL = f"{OPENAI_BASE_URL.rstrip('/')}/v1"
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "EMPTY")
+
 WEAVIATE_ENDPOINT = os.environ.get("WEAVIATE_ENDPOINT", "localhost")
-print(f"{Fore.GREEN} Connecting to Ollama ({AI_MODEL}) LLM: {OLLAMA_ENDPOINT} {Fore.RESET}")
+print(f"{Fore.GREEN} Connecting to OpenAI-compatible LLM ({AI_MODEL}): {OPENAI_BASE_URL} {Fore.RESET}")
 print(f"{Fore.GREEN} Connecting to Weaviate VectorDB: {WEAVIATE_ENDPOINT} {Fore.RESET}")
 
-llm = ChatOllama(model=AI_MODEL, base_url=OLLAMA_ENDPOINT)
-ollama_client = ollama.Client(
-    host=OLLAMA_ENDPOINT,
+llm = ChatOpenAI(
+    model=AI_MODEL,
+    openai_api_base=OPENAI_BASE_URL,
+    openai_api_key=OPENAI_API_KEY,
+)
+
+openai_client = OpenAI(
+    base_url=OPENAI_BASE_URL,
+    api_key=OPENAI_API_KEY,
 )
 
 MAX_PROMPT_LENGTH = 50
@@ -109,18 +122,26 @@ Traceloop.init(
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
+def openai_generate(prompt: str) -> str:
+    response = openai_client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content or ""
+
 def prep_rag():
     # Create the embedding and the Weaviate Client
-    embeddings = OllamaEmbeddings(model=AI_EMBEDDING_MODEL, base_url=OLLAMA_ENDPOINT)
+    embeddings = OpenAIEmbeddings(
+        model=AI_EMBEDDING_MODEL,
+        openai_api_base=OPENAI_BASE_URL,
+        openai_api_key=OPENAI_API_KEY,
+    )
     weaviate_client = weaviate.connect_to_local(host=WEAVIATE_ENDPOINT)
     # Cleanup the collection containing our documents and recreate it
     weaviate_client.collections.delete("KB")
     weaviate_client.collections.create(
         name="KB",
-        vectorizer_config=wvc.config.Configure.Vectorizer.text2vec_ollama(
-            api_endpoint=OLLAMA_ENDPOINT, 
-            model=AI_EMBEDDING_MODEL
-        ),
+        vectorizer_config=wvc.config.Configure.Vectorizer.none(),
         properties=[
             wvc.config.Property(
                 name="text",
@@ -193,23 +214,22 @@ regex = re.compile('[^a-zA-Z]')
 def excuse(city: str)->str:
     """ Returns an excuse why it cannot provide an answer """
     prompt = f"Provide an excuse on why you cannot provide a travel advice about {city}"
-    response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    return response.get("response")
+    return openai_generate(prompt)
 
 @tool
 def valid_city(city: str)->bool:
     """ Returns if the input is a valid city"""
     prompt = f"Is {city} a city? respond ONLY with yes or no."
-    response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    response = regex.sub('', response.get("response")).lower()
+    response = openai_generate(prompt)
+    response = regex.sub('', response).lower()
     return response == "yes" or response.startswith("yes")
 
 @tool
 def travel_advice(city: str)->str:
     """ Provide travel advice for the given city"""
     prompt = f"Give travel advise in a paragraph of max 50 words about {city}"
-    response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    return "Final Answer:" + response.get("response")
+    response = openai_generate(prompt)
+    return "Final Answer:" + response
 
 def prep_agent_executor():
     __tools = [valid_city, travel_advice, excuse]
@@ -298,8 +318,7 @@ def submit_completion(framework: str, prompt: str):
 @task(name="ollama_chat")
 def llm_chat(prompt: str):
     prompt = f"Give travel advise in a paragraph of max 50 words about {prompt}"
-    res = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    return {"message": res.get("response")}
+    return {"message": openai_generate(prompt)}
 
 
 @workflow(name="travelgenerator")
