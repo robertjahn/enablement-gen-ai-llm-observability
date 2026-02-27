@@ -63,8 +63,6 @@ OPENAI_BASE_URL = os.environ.get(
 if not OPENAI_BASE_URL.endswith("/v1"):
     OPENAI_BASE_URL = f"{OPENAI_BASE_URL.rstrip('/')}/v1"
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "EMPTY")
-
 WEAVIATE_ENDPOINT = os.environ.get("WEAVIATE_ENDPOINT", "localhost")
 print(f"{Fore.GREEN} Connecting to OpenAI-compatible LLM ({AI_MODEL}): {OPENAI_BASE_URL} {Fore.RESET}")
 print(f"{Fore.GREEN} Connecting to Weaviate VectorDB: {WEAVIATE_ENDPOINT} {Fore.RESET}")
@@ -72,12 +70,10 @@ print(f"{Fore.GREEN} Connecting to Weaviate VectorDB: {WEAVIATE_ENDPOINT} {Fore.
 llm = ChatOpenAI(
     model=AI_MODEL,
     openai_api_base=OPENAI_BASE_URL,
-    openai_api_key=OPENAI_API_KEY,
 )
 
 openai_client = OpenAI(
     base_url=OPENAI_BASE_URL,
-    api_key=OPENAI_API_KEY,
 )
 
 MAX_PROMPT_LENGTH = 50
@@ -134,7 +130,6 @@ def prep_rag():
     embeddings = OpenAIEmbeddings(
         model=AI_EMBEDDING_MODEL,
         openai_api_base=OPENAI_BASE_URL,
-        openai_api_key=OPENAI_API_KEY,
     )
     weaviate_client = weaviate.connect_to_local(host=WEAVIATE_ENDPOINT)
     # Cleanup the collection containing our documents and recreate it
