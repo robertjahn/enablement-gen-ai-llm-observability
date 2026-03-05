@@ -142,50 +142,35 @@ def travel_advice(city: str)->str:
 
 def prep_agent_executor():
     __tools = [valid_city, travel_advice, excuse]
-    __system = '''Respond to the human as helpfully and accurately as possible. You have access to the following tools:
-    
+    __system = '''You are a travel assistant with access to tools.
+
+Tools:
 {tools}
 
-Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
+You must return exactly one action in JSON with keys "action" and "action_input".
+Valid "action" values are: "Final Answer" or {tool_names}.
 
-Valid "action" values: "Final Answer" or {tool_names}
-
-Provide only ONE action per $JSON_BLOB, as shown:
-
-```
+Output format (exactly):
+Action:
+```json
 {{
-  "action": $TOOL_NAME,
-  "action_input": $INPUT
+    "action": "tool_or_Final Answer",
+    "action_input": "input or final response"
 }}
 ```
 
-Follow this format:
+Rules:
+- Return only one action per response.
+- If you already know the answer, use "Final Answer".
+- If you need a tool, call exactly one tool.
+- Do not output Thought, Observation, or any extra text outside the single Action JSON block.
+'''
 
-Question: input question to answer
-Thought: consider previous and subsequent steps
-Action:
-```
-$JSON_BLOB
-```
-Observation: action result
-... (repeat Thought/Action/Observation N times)
-Thought: I know what to respond
-Action:
-```
-{{
-  "action": "Final Answer",
-  "action_input": "Final response to human"
-}}
-
-Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation.
-Do not add any text outside a single JSON action blob.'''
-
-    __human = '''
-{input}
+    __human = '''{input}
 
 {agent_scratchpad}
 
-(reminder to respond in a JSON blob no matter what)'''
+Return exactly one Action JSON block.'''
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", __system),
