@@ -1,5 +1,5 @@
 from openai import OpenAI
-from langchain.agents import AgentExecutor, create_structured_chat_agent
+from langchain_classic.agents import AgentExecutor, create_structured_chat_agent
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.document_loaders import BSHTMLLoader
@@ -19,11 +19,6 @@ from opentelemetry import trace
 from traceloop.sdk import Traceloop
 from traceloop.sdk.decorators import workflow, task
 from colorama import Fore
-
-import weaviate
-import weaviate.classes as wvc
-from langchain_weaviate.vectorstores import WeaviateVectorStore
-
 
 # disable traceloop telemetry
 os.environ["TRACELOOP_TELEMETRY"] = "false"
@@ -51,29 +46,35 @@ AI_EMBEDDING_MODEL = os.environ.get("AI_EMBEDDING_MODEL", "orca-mini:3b")
 
 # Clean up endpoint making sure it is correctly follow the format:
 # https://<YOUR_ENV>.live.dynatrace.com/api/v2/otlp
-OTEL_ENDPOINT = read_endpoint()
-if OTEL_ENDPOINT.endswith("/v1/traces"):
-    OTEL_ENDPOINT = OTEL_ENDPOINT[: OTEL_ENDPOINT.find("/v1/traces")]
+# Jahn - REMOVE THIS APPORACH
+#OTEL_ENDPOINT = read_endpoint()
+#if OTEL_ENDPOINT.endswith("/v1/traces"):
+#    OTEL_ENDPOINT = OTEL_ENDPOINT[: OTEL_ENDPOINT.find("/v1/traces")]
+OTEL_ENDPOINT=os.environ.get("DT_OTLP_API_ENDPOINT")
+print(f"OTEL_ENDPOINT = {OTEL_ENDPOINT}")
 
 ## Configuration of OpenAI-compatible endpoint & Weaviate
 OPENAI_BASE_URL = os.environ.get(
     "OPENAI_BASE_URL",
     os.environ.get("OLLAMA_ENDPOINT", "http://localhost:11434"),
 )
+OPENAI_API_KEY = os.environ.get(
+    "OPENAI_API_KEY",
+    os.environ.get("OPENAI_API_KEY", "ollama"),
+)
 if not OPENAI_BASE_URL.endswith("/v1"):
     OPENAI_BASE_URL = f"{OPENAI_BASE_URL.rstrip('/')}/v1"
 
-WEAVIATE_ENDPOINT = os.environ.get("WEAVIATE_ENDPOINT", "localhost")
 print(f"{Fore.GREEN} Connecting to OpenAI-compatible LLM ({AI_MODEL}): {OPENAI_BASE_URL} {Fore.RESET}")
-print(f"{Fore.GREEN} Connecting to Weaviate VectorDB: {WEAVIATE_ENDPOINT} {Fore.RESET}")
 
 llm = ChatOpenAI(
     model=AI_MODEL,
-    openai_api_base=OPENAI_BASE_URL,
-)
+    base_url=OPENAI_BASE_URL,
+    api_key=OPENAI_API_KEY,)
 
 openai_client = OpenAI(
     base_url=OPENAI_BASE_URL,
+    api_key=OPENAI_API_KEY,
 )
 
 MAX_PROMPT_LENGTH = 50
@@ -85,27 +86,13 @@ logger = logging.getLogger(__name__)
 #################
 # CONFIGURE TRACELOOP & OTel
 
-TOKEN = read_token()
+# Jahn - update to get from env vars
+#TOKEN = read_token()
+TOKEN=os.environ.get("DT_API_TOKEN")
 headers = {"Authorization": f"Api-Token {TOKEN}"}
 
 # Use the OTel API to instanciate a tracer to generate Spans
 otel_tracer = trace.get_tracer("travel-advisor")
-
-## force weaviate instrumentor
-from opentelemetry.instrumentation.weaviate import WeaviateInstrumentor
-from opentelemetry.instrumentation import weaviate as w
-w.WRAPPED_METHODS = [
-    {
-        # v4.14.1
-        "module": "weaviate.collections.queries.hybrid.query.executor",
-        "object": "_HybridQueryExecutor",
-        "method": "hybrid",
-        "span_name": "db.weaviate.collections.query.hybrid",
-    },
-]
-instrumentor = WeaviateInstrumentor()
-if not instrumentor.is_instrumented_by_opentelemetry:
-    instrumentor.instrument()
 
 # Initialize OpenLLMetry
 Traceloop.init(
@@ -125,79 +112,6 @@ def openai_generate(prompt: str) -> str:
     )
     return response.choices[0].message.content or ""
 
-def prep_rag():
-    # Create the embedding and the Weaviate Client
-    embeddings = OpenAIEmbeddings(
-        model=AI_EMBEDDING_MODEL,
-        openai_api_base=OPENAI_BASE_URL,
-    )
-    weaviate_client = weaviate.connect_to_local(host=WEAVIATE_ENDPOINT)
-    # Cleanup the collection containing our documents and recreate it
-    weaviate_client.collections.delete("KB")
-    weaviate_client.collections.create(
-        name="KB",
-        vectorizer_config=wvc.config.Configure.Vectorizer.none(),
-        properties=[
-            wvc.config.Property(
-                name="text",
-                data_type=wvc.config.DataType.TEXT,
-            ),
-            wvc.config.Property(
-                name="source",
-                data_type=wvc.config.DataType.TEXT,
-            ),
-            wvc.config.Property(
-                name="title",
-                data_type=wvc.config.DataType.TEXT,
-            ),
-        ],
-    )
-
-    # Retrieve the source data
-    docs_list = []
-    for item in os.listdir(path="destinations"):
-        if item.endswith(".html"):
-            item_docs_list = BSHTMLLoader(file_path=f"destinations/{item}").load()
-            for item in item_docs_list:
-                docs_list.append(item)
-
-    # Split Document into tokens
-    text_splitter = RecursiveCharacterTextSplitter()
-    documents = text_splitter.split_documents(docs_list)
-
-    vector = WeaviateVectorStore.from_documents(
-        documents,
-        embeddings,
-        client=weaviate_client,
-        index_name="KB"
-    )
-    retriever = vector.as_retriever()
-
-    prompt = ChatPromptTemplate.from_template(
-        """You are a travel advisor assistant. You MUST use ONLY the information provided in the context below to answer questions.
-    
-    CRITICAL INSTRUCTIONS:
-    - Use ONLY the facts from the context provided below
-    - Do NOT use any external knowledge or information you may have
-    - If the context contains information about the location, use it exactly as written
-    - If the context does not contain relevant information, say "I don't have information about that destination"
-    
-    <context>
-    {context}
-    </context>
-    
-    Question: Give travel advise in a paragraph of max 50 words about {input}                                           
-    """
-    )
-    # Build the RAG Pipeline
-    rag_chain = (
-            {"context": retriever | format_docs, "input": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-    )
-
-    return rag_chain
 
 ##########
 # Agentic Tools
@@ -219,12 +133,12 @@ def valid_city(city: str)->bool:
     response = regex.sub('', response).lower()
     return response == "yes" or response.startswith("yes")
 
-@tool
+@tool(return_direct=True)
 def travel_advice(city: str)->str:
     """ Provide travel advice for the given city"""
     prompt = f"Give travel advise in a paragraph of max 50 words about {city}"
     response = openai_generate(prompt)
-    return "Final Answer:" + response
+    return response
 
 def prep_agent_executor():
     __tools = [valid_city, travel_advice, excuse]
@@ -263,7 +177,8 @@ Action:
   "action_input": "Final response to human"
 }}
 
-Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation'''
+Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation.
+Do not add any text outside a single JSON action blob.'''
 
     __human = '''
 {input}
@@ -284,7 +199,9 @@ Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use
         tools=__tools,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=5,
+        max_iterations=6,
+        max_execution_time=20,
+        early_stopping_method="generate",
     )
 
 
@@ -292,7 +209,6 @@ Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use
 # Setup the endpoints and LangChain
 
 app = FastAPI()
-retrieval_chain = prep_rag()
 agentic_executor = prep_agent_executor()
 
 
@@ -303,7 +219,7 @@ def submit_completion(framework: str, prompt: str):
         if framework == "llm":
             return llm_chat(prompt)
         if framework == "rag":
-            return rag_chat(prompt)
+            return llm_chat(prompt)
         if framework == "agentic":
             return agentic_chat(prompt)
         span.set_status(trace.StatusCode.ERROR, f"{framework} mode is not supported")
@@ -316,29 +232,18 @@ def llm_chat(prompt: str):
     return {"message": openai_generate(prompt)}
 
 
-@workflow(name="travelgenerator")
-def rag_chat(prompt: str):
-    if prompt:
-        logger.info(f"Calling RAG to get the answer to the question: {prompt}...")
-        response = retrieval_chain.invoke( prompt, config={})
-        return {"message": response}
-    else:  # No, or invalid prompt given
-        err_msg = f"No prompt provided or prompt too long (over {MAX_PROMPT_LENGTH} chars)"
-        # Try to augment existing Spans with info
-        span = trace.get_current_span()
-        span.add_event(err_msg)
-        span.set_status(trace.StatusCode.ERROR)
-        return {
-            "message": err_msg
-        }
-
 @task(name="agentic_chat")
 def agentic_chat(prompt: str):
     task = f"If {prompt} is a city, provide a travel advice. "
     response = agentic_executor.invoke({
         "input": task,
     })
-    return {"message": response['output']}
+    output = response.get("output", "")
+    if "Agent stopped due to iteration limit" in output or "time limit" in output:
+        logger.warning(f"Agent fallback triggered for prompt: {prompt}")
+        fallback_prompt = f"Give travel advise in a paragraph of max 50 words about {prompt}"
+        return {"message": openai_generate(fallback_prompt)}
+    return {"message": output}
 
 ####################################
 @app.get("/api/v1/thumbsUp")
