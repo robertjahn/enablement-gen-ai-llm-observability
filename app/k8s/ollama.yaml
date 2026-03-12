@@ -23,7 +23,7 @@ spec:
           lifecycle:
             postStart:
               exec:
-                command: [ "/bin/sh", "-c", "ollama run orca-mini:3b" ]
+                command: [ "/bin/sh", "-c", "ollama run llama3.2:3b" ]
 ---
 apiVersion: v1
 kind: Service

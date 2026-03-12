@@ -1,37 +1,51 @@
-import ollama
-from langchain.agents import AgentExecutor, create_structured_chat_agent
-from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.document_loaders import BSHTMLLoader
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+from openai import OpenAI
+"""
+FastAPI application for AI-powered travel advisor with LLM, RAG, and agentic frameworks.
 
-from langchain_ollama.chat_models import ChatOllama
-from langchain_ollama.embeddings import OllamaEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+This module provides a travel advisor API that supports multiple execution modes:
+- LLM: Direct language model queries
+- Agentic: Tool-based agent that validates cities before providing travel advice
 
+The application integrates with:
+- OpenAI-compatible LLM endpoints (default: Ollama)
+- Dynatrace OpenTelemetry for distributed tracing and observability
+- Traceloop for LLM-specific instrumentation
+
+Environment Variables:
+    AI_MODEL (str): Language model name (default: "orca-mini:3b")
+    AI_EMBEDDING_MODEL (str): Embedding model name (default: "orca-mini:3b")
+    OPENAI_BASE_URL (str): LLM endpoint URL (default: "http://localhost:11434")
+    OPENAI_API_KEY (str): API key for LLM (default: "ollama")
+    OTEL_ENDPOINT (str): Dynatrace OTLP API endpoint for telemetry
+    DT_API_TOKEN (str): Dynatrace API token for authentication
+
+The agentic executor uses a manual tool orchestration pattern:
+1. Validates if input is a valid city name
+2. If valid, generates travel advice
+3. If invalid, provides a humorous excuse
+
+All endpoints are instrumented with OpenTelemetry spans for distributed tracing.
+"""
 import logging
 import os
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+from langchain_classic.agents import AgentExecutor, create_structured_chat_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 
 from opentelemetry import trace
 from traceloop.sdk import Traceloop
-from traceloop.sdk.decorators import workflow, task
+from traceloop.sdk.decorators import task
 from colorama import Fore
-
-import weaviate
-import weaviate.classes as wvc
-from langchain_weaviate.vectorstores import WeaviateVectorStore
-
 
 # disable traceloop telemetry
 os.environ["TRACELOOP_TELEMETRY"] = "false"
 
 def read_token():
     return os.environ.get("API_TOKEN", read_secret("token"))
-
 
 def read_endpoint():
     return os.environ.get("OTEL_ENDPOINT", read_secret("endpoint"))
@@ -50,21 +64,29 @@ def read_secret(secret: str):
 AI_MODEL = os.environ.get("AI_MODEL", "orca-mini:3b")
 AI_EMBEDDING_MODEL = os.environ.get("AI_EMBEDDING_MODEL", "orca-mini:3b")
 
-# Clean up endpoint making sure it is correctly follow the format:
-# https://<YOUR_ENV>.live.dynatrace.com/api/v2/otlp
-OTEL_ENDPOINT = read_endpoint()
-if OTEL_ENDPOINT.endswith("/v1/traces"):
-    OTEL_ENDPOINT = OTEL_ENDPOINT[: OTEL_ENDPOINT.find("/v1/traces")]
+## Configuration of OpenAI-compatible endpoint & Weaviate
+OPENAI_BASE_URL = os.environ.get(
+    "OPENAI_BASE_URL",
+    os.environ.get("OLLAMA_ENDPOINT", "http://localhost:11434"),
+)
+OPENAI_API_KEY = os.environ.get(
+    "OPENAI_API_KEY",
+    os.environ.get("OPENAI_API_KEY", "ollama"),
+)
+if not OPENAI_BASE_URL.endswith("/v1"):
+    OPENAI_BASE_URL = f"{OPENAI_BASE_URL.rstrip('/')}/v1"
 
-## Configuration of OLLAMA & Weaviate
-OLLAMA_ENDPOINT = os.environ.get("OLLAMA_ENDPOINT", "http://localhost:11434")
-WEAVIATE_ENDPOINT = os.environ.get("WEAVIATE_ENDPOINT", "localhost")
-print(f"{Fore.GREEN} Connecting to Ollama ({AI_MODEL}) LLM: {OLLAMA_ENDPOINT} {Fore.RESET}")
-print(f"{Fore.GREEN} Connecting to Weaviate VectorDB: {WEAVIATE_ENDPOINT} {Fore.RESET}")
+print(f"{Fore.GREEN} Connecting to OpenAI-compatible LLM ({AI_MODEL}): {OPENAI_BASE_URL} {Fore.RESET}")
 
-llm = ChatOllama(model=AI_MODEL, base_url=OLLAMA_ENDPOINT)
-ollama_client = ollama.Client(
-    host=OLLAMA_ENDPOINT,
+openai_client = OpenAI(
+    base_url=OPENAI_BASE_URL,
+    api_key=OPENAI_API_KEY,
+)
+
+llm = ChatOpenAI(
+    model=AI_MODEL,
+    base_url=OPENAI_BASE_URL,
+    api_key=OPENAI_API_KEY,
 )
 
 MAX_PROMPT_LENGTH = 50
@@ -76,27 +98,16 @@ logger = logging.getLogger(__name__)
 #################
 # CONFIGURE TRACELOOP & OTel
 
-TOKEN = read_token()
+# Prefer direct Dynatrace OTLP endpoint when present, otherwise fallback to OTEL_ENDPOINT/secret.
+OTEL_ENDPOINT = os.environ.get("DT_OTLP_API_ENDPOINT") 
+#OTEL_ENDPOINT = os.environ.get("OTEL_ENDPOINT")
+print(f"OTEL_ENDPOINT = {OTEL_ENDPOINT}")
+
+#TOKEN = read_token()
+TOKEN=os.environ.get("DT_API_TOKEN")
 headers = {"Authorization": f"Api-Token {TOKEN}"}
 
-# Use the OTel API to instanciate a tracer to generate Spans
 otel_tracer = trace.get_tracer("travel-advisor")
-
-## force weaviate instrumentor
-from opentelemetry.instrumentation.weaviate import WeaviateInstrumentor
-from opentelemetry.instrumentation import weaviate as w
-w.WRAPPED_METHODS = [
-    {
-        # v4.14.1
-        "module": "weaviate.collections.queries.hybrid.query.executor",
-        "object": "_HybridQueryExecutor",
-        "method": "hybrid",
-        "span_name": "db.weaviate.collections.query.hybrid",
-    },
-]
-instrumentor = WeaviateInstrumentor()
-if not instrumentor.is_instrumented_by_opentelemetry:
-    instrumentor.instrument()
 
 # Initialize OpenLLMetry
 Traceloop.init(
@@ -106,82 +117,12 @@ Traceloop.init(
     headers=headers,
 )
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
-def prep_rag():
-    # Create the embedding and the Weaviate Client
-    embeddings = OllamaEmbeddings(model=AI_EMBEDDING_MODEL, base_url=OLLAMA_ENDPOINT)
-    weaviate_client = weaviate.connect_to_local(host=WEAVIATE_ENDPOINT)
-    # Cleanup the collection containing our documents and recreate it
-    weaviate_client.collections.delete("KB")
-    weaviate_client.collections.create(
-        name="KB",
-        vectorizer_config=wvc.config.Configure.Vectorizer.text2vec_ollama(
-            api_endpoint=OLLAMA_ENDPOINT, 
-            model=AI_EMBEDDING_MODEL
-        ),
-        properties=[
-            wvc.config.Property(
-                name="text",
-                data_type=wvc.config.DataType.TEXT,
-            ),
-            wvc.config.Property(
-                name="source",
-                data_type=wvc.config.DataType.TEXT,
-            ),
-            wvc.config.Property(
-                name="title",
-                data_type=wvc.config.DataType.TEXT,
-            ),
-        ],
+def openai_generate(prompt: str) -> str:
+    response = openai_client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
     )
-
-    # Retrieve the source data
-    docs_list = []
-    for item in os.listdir(path="destinations"):
-        if item.endswith(".html"):
-            item_docs_list = BSHTMLLoader(file_path=f"destinations/{item}").load()
-            for item in item_docs_list:
-                docs_list.append(item)
-
-    # Split Document into tokens
-    text_splitter = RecursiveCharacterTextSplitter()
-    documents = text_splitter.split_documents(docs_list)
-
-    vector = WeaviateVectorStore.from_documents(
-        documents,
-        embeddings,
-        client=weaviate_client,
-        index_name="KB"
-    )
-    retriever = vector.as_retriever()
-
-    prompt = ChatPromptTemplate.from_template(
-        """You are a travel advisor assistant. You MUST use ONLY the information provided in the context below to answer questions.
-    
-    CRITICAL INSTRUCTIONS:
-    - Use ONLY the facts from the context provided below
-    - Do NOT use any external knowledge or information you may have
-    - If the context contains information about the location, use it exactly as written
-    - If the context does not contain relevant information, say "I don't have information about that destination"
-    
-    <context>
-    {context}
-    </context>
-    
-    Question: Give travel advise in a paragraph of max 50 words about {input}                                           
-    """
-    )
-    # Build the RAG Pipeline
-    rag_chain = (
-            {"context": retriever | format_docs, "input": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-    )
-
-    return rag_chain
+    return response.choices[0].message.content or ""
 
 ##########
 # Agentic Tools
@@ -190,32 +131,47 @@ import re
 regex = re.compile('[^a-zA-Z]')
 
 @tool
-def excuse(city: str)->str:
-    """ Returns an excuse why it cannot provide an answer """
-    prompt = f"Provide an excuse on why you cannot provide a travel advice about {city}"
-    response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    return response.get("response")
-
-@tool
-def valid_city(city: str)->bool:
-    """ Returns if the input is a valid city"""
+@task(name="tool_valid_city")
+def valid_city(city: str) -> bool:
+    """Returns if the input is a valid city"""
     prompt = f"Is {city} a city? respond ONLY with yes or no."
-    response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    response = regex.sub('', response.get("response")).lower()
+    response = openai_generate(prompt)
+    response = regex.sub('', response).lower()
     return response == "yes" or response.startswith("yes")
 
-@tool
-def travel_advice(city: str)->str:
-    """ Provide travel advice for the given city"""
+@tool(return_direct=True)
+@task(name="tool_travel_advice")
+def travel_advice(city: str) -> str:
+    """Provide travel advice for the given city"""
     prompt = f"Give travel advise in a paragraph of max 50 words about {city}"
-    response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    return "Final Answer:" + response.get("response")
+    response = openai_generate(prompt)
+    return response
 
-def prep_agent_executor():
-    __tools = [valid_city, travel_advice, excuse]
-    __system = '''Respond to the human as helpfully and accurately as possible. You have access to the following tools:
-    
+@tool(return_direct=True)
+@task(name="tool_excuse")
+def excuse(city: str) -> str:
+    """Returns an excuse why it cannot provide an answer"""
+    prompt = f"Provide an excuse on why you cannot provide a travel advice about {city}"
+    return openai_generate(prompt)
+
+
+############
+# Setup the endpoints and LangChain
+
+def prep_agent_executor() -> AgentExecutor:
+    tools = [valid_city, travel_advice, excuse]
+    system_prompt = '''Respond to the human as helpfully and accurately as possible. You have access to the following tools:
+
 {tools}
+
+MANDATORY WORKFLOW RULES:
+1) You MUST call "valid_city" first, exactly once.
+2) If valid_city result is true/yes, your next and only tool call MUST be "travel_advice".
+3) If valid_city result is false/no, your next and only tool call MUST be "excuse".
+4) Never call "travel_advice" or "excuse" before calling "valid_city".
+5) Never skip tools and never answer directly before completing this workflow.
+6) Never call the same tool more than once.
+7) After calling "travel_advice" or "excuse", immediately finish; do not call any additional tools.
 
 Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
 
@@ -248,38 +204,36 @@ Action:
   "action_input": "Final response to human"
 }}
 
-Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation'''
+Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation.
+Do not add any text outside a single JSON action blob.'''
 
-    __human = '''
+    human_prompt = '''
 {input}
 
 {agent_scratchpad}
 
 (reminder to respond in a JSON blob no matter what)'''
+
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", __system),
+            ("system", system_prompt),
             MessagesPlaceholder("chat_history", optional=True),
-            ("human", __human),
+            ("human", human_prompt),
         ]
     )
-    agent = create_structured_chat_agent(llm, __tools, prompt)
+    agent = create_structured_chat_agent(llm, tools, prompt)
     return AgentExecutor(
         agent=agent,
-        tools=__tools,
+        tools=tools,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=5,
+        max_iterations=6,
+        max_execution_time=20,
+        early_stopping_method="force",
     )
 
-
-############
-# Setup the endpoints and LangChain
-
 app = FastAPI()
-retrieval_chain = prep_rag()
 agentic_executor = prep_agent_executor()
-
 
 ####################################
 @app.get("/api/v1/completion")
@@ -287,44 +241,34 @@ def submit_completion(framework: str, prompt: str):
     with otel_tracer.start_as_current_span(name="/api/v1/completion", kind=trace.SpanKind.SERVER) as span:
         if framework == "llm":
             return llm_chat(prompt)
-        if framework == "rag":
-            return rag_chat(prompt)
         if framework == "agentic":
             return agentic_chat(prompt)
-        span.set_status(trace.StatusCode.ERROR, f"{framework} mode is not supported")
         return {"message": "invalid Mode"}
 
 
-@task(name="ollama_chat")
+@task(name="llm_chat")
 def llm_chat(prompt: str):
     prompt = f"Give travel advise in a paragraph of max 50 words about {prompt}"
-    res = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-    return {"message": res.get("response")}
+    return {"message": openai_generate(prompt)}
 
-
-@workflow(name="travelgenerator")
-def rag_chat(prompt: str):
-    if prompt:
-        logger.info(f"Calling RAG to get the answer to the question: {prompt}...")
-        response = retrieval_chain.invoke( prompt, config={})
-        return {"message": response}
-    else:  # No, or invalid prompt given
-        err_msg = f"No prompt provided or prompt too long (over {MAX_PROMPT_LENGTH} chars)"
-        # Try to augment existing Spans with info
-        span = trace.get_current_span()
-        span.add_event(err_msg)
-        span.set_status(trace.StatusCode.ERROR)
-        return {
-            "message": err_msg
-        }
 
 @task(name="agentic_chat")
 def agentic_chat(prompt: str):
-    task = f"If {prompt} is a city, provide a travel advice. "
+    city = prompt.strip()
+    is_valid = valid_city.invoke(city)
+    if not is_valid:
+        return {"message": excuse.invoke(city)}
+
+    task_input = f"{city} is a valid city. Use travel_advice exactly once and return the final answer."
     response = agentic_executor.invoke({
-        "input": task,
+        "input": task_input,
     })
-    return {"message": response['output']}
+    output = response.get("output", "")
+    if "Agent stopped due to iteration limit" in output or "time limit" in output:
+        logger.warning(f"Agent fallback triggered for prompt: {prompt}")
+        fallback_prompt = f"Give travel advise in a paragraph of max 50 words about {prompt}"
+        return {"message": openai_generate(fallback_prompt)}
+    return {"message": output}
 
 ####################################
 @app.get("/api/v1/thumbsUp")
